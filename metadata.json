@@ -1,0 +1,5 @@
+{
+  "name": "InfraScout AI",
+  "description": "Autonomous market intelligence engine for Infrastructure/EPC companies. Scrapes land allotments, uses Gemini for parsing/enrichment, and presents a daily lead list.",
+  "requestFramePermissions": []
+}
