@@ -1,14 +1,24 @@
+
 import { db } from './firebase';
 import { collection, query, where, getDocs, addDoc, Timestamp, updateDoc, doc } from 'firebase/firestore';
 import { Lead, DecisionMaker } from '../types';
 
 // Get the API base URL based on environment
-const getApiUrl = () => {
-    const useEmulator = (import.meta as any).env.VITE_USE_EMULATOR === 'true';
+const getApiUrl = (): string => {
+    const env = import.meta.env;
+    const useEmulator = env.VITE_USE_EMULATOR === 'true';
+
     if (useEmulator) {
-        return (import.meta as any).env.VITE_FUNCTIONS_EMULATOR_URL || 'http://127.0.0.1:5001/infrascout-ai/us-central1';
+        return (
+            env.VITE_FUNCTIONS_EMULATOR_URL ||
+            'http://127.0.0.1:5001/infrascout-ai/us-central1'
+        );
     }
-    return (import.meta as any).env.VITE_FUNCTIONS_URL || 'https://us-central1-infrascout-ai.cloudfunctions.net';
+
+    return (
+        env.VITE_REACT_APP_API_URL ||
+        'https://us-central1-infrascout-ai.cloudfunctions.net'
+    );
 };
 
 // Helper to call API with timeout fallback
@@ -16,29 +26,53 @@ const callApiWithFallback = async (
     endpoint: string,
     method: string = 'POST',
     data: any = {},
-    timeoutMs: number = 5000
+    timeoutMs: number = 60000
 ) => {
+    const controller = new AbortController();
+
     try {
         const url = `${getApiUrl()}/${endpoint}`;
         console.log(`📡 Calling ${method} ${url}`);
 
-        // Create abort signal with timeout
-        const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
         const response = await fetch(url, {
             method,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(data),
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: method !== 'GET' ? JSON.stringify(data) : undefined,
             signal: controller.signal,
         });
 
         clearTimeout(timeoutId);
 
-        if (!response.ok) throw new Error(`API Error: ${response.status}`);
-        return await response.json();
+        const responseText = await response.text();
+
+        let responseData: any;
+        try {
+            responseData = responseText ? JSON.parse(responseText) : null;
+        } catch {
+            responseData = responseText;
+        }
+
+        if (!response.ok) {
+            throw new Error(
+                responseData?.error ||
+                responseData?.message ||
+                `API Error ${response.status}`
+            );
+        }
+
+        return responseData;
+
     } catch (error: any) {
-        console.warn(`⚠️ API Error (${endpoint}): ${error.message}`);
+        if (error.name === 'AbortError') {
+            console.error(`⏱️ ${endpoint} timed out`);
+            return null;
+        }
+
+        console.error(`❌ API Error (${endpoint}):`, error.message);
         return null;
     }
 };
@@ -67,57 +101,51 @@ export const triggerDailyScout = async (portalId: string) => {
     console.log(`🔍 Scouting ${portalId}...`);
 
     try {
-        // Try real backend first (longer timeout for Puppeteer/Gemini)
-        const backendResult = await callApiWithFallback('dailyScout', 'POST', {
-            portalId,
-        }, 120000); // 2 minutes for real backend
+        const backendResult = await callApiWithFallback(
+            'dailyScout',
+            'POST',
+            { portalId },
+            180000 // 3 min for Puppeteer + Gemini
+        );
 
-        if (backendResult?.results && backendResult.results.added > 0) {
-            console.log(`✅ Found ${backendResult.results.added} real leads from backend`);
+        console.log('📦 Full backend response:', backendResult);
+
+        // ❌ Backend totally failed
+        if (!backendResult || backendResult.success === false) {
             return {
-                addedCount: backendResult.results.added,
-                mode: 'real',
-                message: `Successfully found ${backendResult.results.added} leads`
+                addedCount: 0,
+                mode: 'error',
+                message:
+                    backendResult?.error ||
+                    'Backend failed. Check Firebase emulator terminal.',
             };
         }
 
-        // Fallback to mock data
-        console.log('📊 Falling back to mock data...');
-        const mockLeads = generateMockLeads(portalId);
-
-        // Add mock leads to Firestore
-        for (const lead of mockLeads) {
-            await addDoc(collection(db, 'leads'), {
-                ...lead,
-                createdAt: Timestamp.now(),
-                isDemoData: true,
-                decisionMakers: generateMockDecisionMakers(lead.companyName || 'Company'),
-            });
+        // ✅ Leads found
+        if (backendResult?.results?.added > 0) {
+            return {
+                addedCount: backendResult.results.added,
+                mode: 'real',
+                message: `Successfully found ${backendResult.results.added} leads`,
+            };
         }
 
+        // ⚠️ Function worked but no leads
         return {
-            addedCount: mockLeads.length,
-            mode: 'mock',
-            message: `Generated ${mockLeads.length} demo leads`
+            addedCount: 0,
+            mode: 'empty',
+            message:
+                backendResult?.results?.errors?.length > 0
+                    ? backendResult.results.errors.join(' | ')
+                    : `No new leads found for ${portalId}`,
         };
-    } catch (error) {
-        console.error('Error in triggerDailyScout:', error);
-
-        // Ultimate fallback - still add mock data
-        const mockLeads = generateMockLeads(portalId);
-        for (const lead of mockLeads) {
-            await addDoc(collection(db, 'leads'), {
-                ...lead,
-                createdAt: Timestamp.now(),
-                isDemoData: true,
-                decisionMakers: generateMockDecisionMakers(lead.companyName || 'Company'),
-            });
-        }
+    } catch (error: any) {
+        console.error('❌ Error in triggerDailyScout:', error);
 
         return {
-            addedCount: mockLeads.length,
-            mode: 'mock',
-            message: `Generated ${mockLeads.length} demo leads (fallback)`
+            addedCount: 0,
+            mode: 'error',
+            message: error.message || 'Unknown scout error',
         };
     }
 };
@@ -143,66 +171,55 @@ const REAL_PORTAL_URLS: Record<string, string> = {
 };
 
 // ✅ Generate mock leads with realistic data
-const generateMockLeads = (portalId: string): Omit<Lead, 'id' | 'createdAt'>[] => {
-    const mockCompanies = [
-        'Reliance Industries Limited',
-        'Tata Steel Limited',
-        'Jindal Steel & Power Limited',
-        'Vedanta Limited',
-        'JSW Steel Limited',
-    ];
+// const generateMockLeads = (portalId: string): Omit<Lead, 'id' | 'createdAt'>[] => {
+//     const mockCompanies = [
+//         'Reliance Industries Limited',
+//         'Tata Steel Limited',
+//         'Jindal Steel & Power Limited',
+//         'Vedanta Limited',
+//         'JSW Steel Limited',
+//     ];
 
-    const mockSectors = [
-        'Steel & Metals',
-        'Pharmaceuticals',
-        'Electronics Manufacturing',
-        'Textiles & Apparel',
-        'Logistics & Warehousing',
-    ];
+//     const mockSectors = [
+//         'Steel & Metals',
+//         'Pharmaceuticals',
+//         'Electronics Manufacturing',
+//         'Textiles & Apparel',
+//         'Logistics & Warehousing',
+//     ];
 
-    const realPortalUrl = REAL_PORTAL_URLS[portalId] || `https://${portalId.toLowerCase()}.gov.in`;
+//     const realPortalUrl = REAL_PORTAL_URLS[portalId] || `https://${portalId.toLowerCase()}.gov.in`;
 
-    const leads: Omit<Lead, 'id' | 'createdAt'>[] = [];
+//     const leads: Omit<Lead, 'id' | 'createdAt'>[] = [];
 
-    for (let i = 0; i < 3; i++) {
-        const company = mockCompanies[i % mockCompanies.length];
-        const sector = mockSectors[i % mockSectors.length];
+//     for (let i = 0; i < 3; i++) {
+//         const company = mockCompanies[i % mockCompanies.length];
+//         const sector = mockSectors[i % mockSectors.length];
 
-        leads.push({
-            companyName: `${company} - Unit ${i + 1}`,
-            plotNo: `PLOT-${String(i + 1).padStart(3, '0')}-${portalId}`,
-            acreage: 5 + i * 2,
-            date: new Date().toISOString().split('T')[0],
-            portalId: portalId,
-            sourceUrl: `${realPortalUrl}/industrial-allotments`,
-            sector: sector,
-            website: `https://${company.replace(/\s/g, '').toLowerCase()}.com`,
-            contactEmail: `contact@${company.replace(/\s/g, '').toLowerCase()}.com`,
-            contactPhone: '+91-XXXXX-XXXXX',
-            summary: `Industrial facility specializing in ${sector} in ${PORTAL_STATE_MAP[portalId] || portalId}`,
-            status: 'new',
-            decisionMakers: [],
-        });
-    }
+//         leads.push({
+//             companyName: `${company} - Unit ${i + 1}`,
+//             plotNo: `PLOT-${String(i + 1).padStart(3, '0')}-${portalId}`,
+//             acreage: 5 + i * 2,
+//             date: new Date().toISOString().split('T')[0],
+//             portalId: portalId,
+//             sourceUrl: `${realPortalUrl}/industrial-allotments`,
+//             sector: sector,
+//             website: `https://${company.replace(/\s/g, '').toLowerCase()}.com`,
+//             contactEmail: `contact@${company.replace(/\s/g, '').toLowerCase()}.com`,
+//             contactPhone: '+91-XXXXX-XXXXX',
+//             summary: `Industrial facility specializing in ${sector} in ${PORTAL_STATE_MAP[portalId] || portalId}`,
+//             status: 'new',
+//             decisionMakers: [],
+//         });
+//     }
 
-    return leads;
-};
+//     return leads;
+// };
 
-// ✅ Generate mock decision makers
-const generateMockDecisionMakers = (companyName: string): DecisionMaker[] => {
-    const titles = [
-        { name: 'Rajesh Kumar', role: 'Managing Director', phone: '+91-9876543210' },
-        { name: 'Priya Sharma', role: 'Head of Operations', phone: '+91-9876543211' },
-        { name: 'Amit Patel', role: 'Project Director', phone: '+91-9876543212' },
-    ];
-
-    return titles.map((person) => ({
-        name: person.name,
-        role: person.role,
-        email: `${person.name.toLowerCase().replace(/\s/g, '.')}@${companyName.replace(/\s/g, '').toLowerCase()}.com`,
-        contact: person.phone,
-    }));
-};
+// ⚠️ DEPRECATED: Use real backend instead
+// const generateMockDecisionMakers = (companyName: string): DecisionMaker[] => {
+//     return [];
+// };
 
 // ✅ Draft a cold email for a lead
 export const draftColdEmail = async (lead: Lead): Promise<{ subject: string; body: string }> => {
@@ -251,7 +268,7 @@ This property presents significant potential for your ${sector} operations, with
 Would you be available for a brief call this week to discuss this opportunity in detail?
 
 Best regards,
-InfraScout AI Team`
+Nadendla AI Team`
     };
 };
 
@@ -280,7 +297,8 @@ export const deepResearchLead = async (lead: Lead): Promise<DecisionMaker[]> => 
             if (lead.id) {
                 try {
                     await updateDoc(doc(db, 'leads', lead.id), {
-                        decisionMakers: backendResult.decisionMakers
+                        decisionMakers: backendResult.decisionMakers,
+                        status: 'researched',
                     });
                 } catch (updateError) {
                     console.warn('Could not update lead with decision makers:', updateError);
@@ -290,11 +308,12 @@ export const deepResearchLead = async (lead: Lead): Promise<DecisionMaker[]> => 
             return backendResult.decisionMakers;
         }
 
-        // Fallback to mock decision makers
-        return generateMockDecisionMakers(company);
+        // No fallback to mock data in production
+        console.log('⚠️ No decision makers found for this company');
+        return [];
     } catch (error) {
         console.error('Error in deep research:', error);
-        return generateMockDecisionMakers(company);
+        return [];
     }
 };
 
@@ -359,38 +378,14 @@ export const updateLeadStatus = async (leadId: string, status: 'new' | 'viewed' 
 // ✅ Add decision makers to a lead
 export const addDecisionMakersToLead = async (leadId: string, decisionMakers: DecisionMaker[]): Promise<boolean> => {
     try {
-        await updateDoc(doc(db, 'leads', leadId), { decisionMakers });
+        await updateDoc(doc(db, 'leads', leadId), {
+            decisionMakers,
+            status: 'researched',
+        });
         return true;
     } catch (error) {
         console.error('Error adding decision makers:', error);
         return false;
-    }
-};
-
-// ✅ Seed dummy data to database
-export const seedDummyDataToDB = async (): Promise<{ success: boolean; count: number; message: string }> => {
-    console.log('🌱 Seeding dummy data to Firebase...');
-
-    try {
-        const backendResult = await callApiWithFallback('seedDummyData', 'POST', {}, 30000);
-
-        if (backendResult?.success) {
-            console.log(`✅ Seeded ${backendResult.count} dummy leads`);
-            return {
-                success: true,
-                count: backendResult.count,
-                message: backendResult.message
-            };
-        }
-
-        throw new Error('Seeding failed');
-    } catch (error: any) {
-        console.error('Error seeding data:', error);
-        return {
-            success: false,
-            count: 0,
-            message: `Error: ${error.message}`
-        };
     }
 };
 

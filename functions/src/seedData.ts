@@ -1,7 +1,14 @@
-import * as admin from 'firebase-admin';
+import * as admin from "firebase-admin";
 
-// Initialize Admin SDK
+if (!admin.apps.length) {
+    admin.initializeApp();
+}
+
 const db = admin.firestore();
+// import * as admin from 'firebase-admin';
+
+// // Initialize Admin SDK
+// const db = admin.firestore();
 
 // Real Indian company names by sector
 const COMPANIES_BY_SECTOR: Record<string, string[]> = {

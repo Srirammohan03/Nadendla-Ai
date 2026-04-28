@@ -1,34 +1,65 @@
+// functions/src/gemini.ts
+import * as dotenv from "dotenv";
+dotenv.config();
+
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import * as functions from "firebase-functions";
-
-// Initialize Gemini Client
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+// ======================================================
+// GEMINI API KEY LOADING (Production Safe)
+// ======================================================
 let apiKey = process.env.GEMINI_API_KEY;
 
-if (!apiKey) {
-    try {
-        apiKey = functions.config()?.gemini?.key;
-    } catch (e) {
-        console.warn("Could not get Gemini key from functions.config()");
-    }
+const finalApiKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.GENERATIVE_API_KEY;
+if (!finalApiKey) {
+    throw new Error("❌ CRITICAL: No Gemini API key available");
 }
 
-if (!apiKey) {
-    console.error("❌ GEMINI_API_KEY not set");
-}
+console.log("Gemini Key Exists:", finalApiKey ? "YES" : "NO");
 
-// Initialize Generative API Key (fallback)
-let generativeApiKey = process.env.GENERATIVE_API_KEY;
 
-if (!generativeApiKey) {
-    try {
-        generativeApiKey = functions.config()?.generative?.key;
-    } catch (e) {
-        console.warn("Could not get Generative API key from functions.config()");
-    }
-}
+// ======================================================
+// MODEL CONFIG
+// ======================================================
+// For v1beta API (older projects), use: gemini-1.5-flash
+// For v1 API (newer projects), use: gemini-1.5-flash-flash
+// Modern Google AI Studio API
+const ai = new GoogleGenerativeAI(finalApiKey);
 
-const ai = new GoogleGenerativeAI(apiKey || generativeApiKey || "");
+// ======================================================
+// MODEL CONFIG
+// ======================================================
+const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
+console.log(`🚀 Using Gemini Model: ${MODEL_NAME}`);
+
+const getModel = (systemInstruction?: string) =>
+    ai.getGenerativeModel({
+        model: MODEL_NAME,
+        ...(systemInstruction
+            ? {
+                systemInstruction,
+            }
+            : {}),
+    });
+
+
+// =====================================================
+// WHY:
+// Your installed @google/generative-ai version does NOT support:
+// responseMimeType
+//
+// That feature exists only in newer SDK versions.
+// Your current firebase/functions stack is older.
+//
+// So use prompt-enforced JSON instead.
+// =====================================================
+
+// ======================================================
+// TYPES
+// ======================================================
 export interface ExtractedLead {
     CompanyName: string | null;
     PlotNo: string | null;
@@ -47,186 +78,332 @@ export interface EnrichedData {
 export interface DecisionMaker {
     name: string;
     role: string;
-    contact?: string;
-    email?: string;
+    contact?: string | null;
+    email?: string | null;
 }
 
-export const parseHtmlWithGemini = async (htmlContent: string): Promise<ExtractedLead[]> => {
+// ======================================================
+// HELPERS
+// ======================================================
+const cleanHtmlForAi = (html: string): string => {
+    return html
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "")
+        .replace(/\s+/g, " ")
+        .trim(); // No more substring limit! Let Gemini read the whole page.
+};
+
+const safeJsonParse = <T>(text: string, fallback: T): T => {
+    try {
+        const cleaned = text
+            .replace(/```json/gi, "")
+            .replace(/```/g, "")
+            .trim();
+
+        return JSON.parse(cleaned);
+    } catch {
+        return fallback;
+    }
+};
+
+const extractJsonArray = (text: string): string | null => {
+    const match = text.match(/\[[\s\S]*\]/);
+    return match ? match[0] : null;
+};
+
+const extractJsonObject = (text: string): string | null => {
+    const match = text.match(/\{[\s\S]*\}/);
+    return match ? match[0] : null;
+};
+
+// ======================================================
+// PARSE HTML FOR LAND LEADS
+// ======================================================
+export const parseHtmlWithGemini = async (
+    htmlContent: string
+): Promise<ExtractedLead[]> => {
     if (!htmlContent || htmlContent.length < 50) return [];
 
-    const truncatedHtml = htmlContent.substring(0, 50000);
+    const cleanedHtml = cleanHtmlForAi(htmlContent);
 
     try {
-        const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const model = getModel(`
+You are an industrial land allotment extraction engine.
 
-        const response = await model.generateContent(`Extract industrial land allotments from this HTML.
+Extract ALL valid industrial/commercial land allotment records.
 
-Return ONLY a JSON array:
-[{"CompanyName": "name or null", "PlotNo": "plot or null", "Acreage": number or null, "Date": "YYYY-MM-DD or null"}]
+IGNORE:
+- Header/footer/navigation
+- Menus
+- Scripts
+- Residential
+- Irrelevant tenders
+- Empty rows
 
-Rules: Industrial only, ignore residential/repairs, convert dates properly, use null if unclear.
+RETURN ONLY:
+A valid JSON array.
 
-HTML:\n${truncatedHtml}`);
+FORMAT:
+[
+  {
+    "CompanyName": "string",
+    "PlotNo": "string",
+    "Acreage": number,
+    "Date": "YYYY-MM-DD"
+  }
+]
 
-        const text = response.response.text();
-        const jsonMatch = text.match(/\[[\s\S]*\]/);
-        if (!jsonMatch) return [];
+RULES:
+- Convert sq meters to acres if possible
+- Null if unavailable
+- No markdown
+- No explanation
+- Return [] if none
+`);
 
-        return JSON.parse(jsonMatch[0]);
+        console.log("📤 Sending HTML to Gemini...");
+        console.log(`📄 HTML Payload Length: ${cleanedHtml.length}`);
+
+
+
+        // 🔥 THE STUBBORN AUTO-RETRY LOOP 🔥
+        let rawText = "";
+        let retries = 5; // Increased to 5 attempts
+
+        while (retries > 0) {
+            try {
+                const result = await model.generateContent(cleanedHtml); // (Use 'prompt' for the enrich function)
+                rawText = result.response.text();
+                break; // Success! Break out of the loop.
+            } catch (error: any) {
+                if (error.status === 503 && retries > 1) {
+                    console.log(`⚠️ Google API overloaded (503). Retrying in 15 seconds... (${retries - 1} attempts left)`);
+                    await delay(15000); // Increased wait to 15 seconds to let the traffic clear
+                    retries--;
+                } else {
+                    throw error;
+                }
+            }
+        }
+
+        console.log(`📥 Gemini Response Length: ${rawText.length}`);
+        // const rawText = result.response.text();
+
+
+        const jsonArray = extractJsonArray(rawText);
+
+        if (!jsonArray) {
+            console.log("⚠️ No valid JSON array found");
+            return [];
+        }
+
+        const parsed = safeJsonParse<any[]>(jsonArray, []);
+
+        if (!Array.isArray(parsed)) return [];
+
+        const validated: ExtractedLead[] = parsed
+            .filter(
+                (lead) =>
+                    lead &&
+                    (lead.CompanyName || lead.PlotNo)
+            )
+            .map((lead) => ({
+                CompanyName: lead.CompanyName || null,
+                PlotNo: lead.PlotNo || null,
+                Acreage:
+                    typeof lead.Acreage === "number"
+                        ? lead.Acreage
+                        : lead.Acreage
+                            ? Number(lead.Acreage)
+                            : null,
+                Date: lead.Date || null,
+            }));
+
+        console.log(`✅ Parsed ${validated.length} leads`);
+
+        return validated;
     } catch (error) {
-        console.error("Parse Error:", error);
+        console.error("❌ Parse Error:", error);
         return [];
     }
 };
 
-export const enrichLeadWithGemini = async (companyName: string, portalName: string): Promise<EnrichedData> => {
-    try {
-        const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-        const response = await model.generateContent(`Company: "${companyName}" got industrial land in ${portalName}, India.
-
-TASK: Identify the SINGLE MOST LIKELY industry sector.
-
-Options: Manufacturing, Technology, Pharmaceuticals, Automotive, Electronics, Textiles, Logistics, Metals & Steel, Chemicals, Food Processing, Renewable Energy, Infrastructure, Defence, Agriculture, Other
-
-Return ONLY the sector name (one word or compound, e.g., "Steel & Metals"). Do not add explanation.`);
-
-        const sector = response.response.text().trim() || "Manufacturing";
-
-        // Additional research for contact info (optional)
-        let website = null;
-        let email = null;
-        let phone = null;
-
-        try {
-            const contactResponse = await model.generateContent(`For company "${companyName}", provide:
-1. Official website URL (or null)
-2. Main contact email (or null)  
-3. Main phone (or null)
-
-Format: website|email|phone (use "null" for unknown)`);
-
-            const contactText = contactResponse.response.text().trim();
-            const parts = contactText.split('|');
-
-            website = parts[0]?.toLowerCase().includes('null') ? null : parts[0]?.trim() || null;
-            email = parts[1]?.toLowerCase().includes('null') ? null : parts[1]?.trim() || null;
-            phone = parts[2]?.toLowerCase().includes('null') ? null : parts[2]?.trim() || null;
-        } catch (e) {
-            console.warn("Could not fetch contact info:", e);
-        }
-
-        return {
-            sector,
-            website,
-            email,
-            phone,
-            summary: `${sector} facility in ${portalName}`
-        };
-    } catch (error) {
-        console.error("Enrichment Error:", error);
+// ======================================================
+// ENRICH COMPANY
+// ======================================================
+export const enrichLeadWithGemini = async (
+    companyName: string,
+    portalName: string
+): Promise<EnrichedData> => {
+    // If we don't have a company name, return a safe default immediately
+    if (!companyName || companyName === "") {
         return {
             sector: "Manufacturing",
             website: null,
             email: null,
             phone: null,
-            summary: `Industrial facility in ${portalName}`
+            summary: `Industrial facility in ${portalName}`,
         };
     }
-};
 
-export const generateEmailDraft = async (companyName: string, plotNo: string, sector: string): Promise<{ subject: string; body: string }> => {
     try {
-        const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-        const response = await model.generateContent(`Write a professional cold email to ${companyName} about their new ${sector} facility at plot ${plotNo} in India.
-
-Requirements:
-- Subject line: Max 60 characters, professional
-- Body: 3-4 short paragraphs, value-focused
-- Mention industrial expansion opportunity
-- Include call-to-action
-- Professional but not sales-y
-
-Return ONLY valid JSON:
+        const model = getModel(`
+You are a business sector classifier.
+Return ONLY JSON:
 {
-  "subject": "subject line here",
-  "body": "email body here"
-}`);
+  "sector": "string",
+  "summary": "string"
+}
+Allowed sectors:
+Manufacturing, Technology, Pharmaceuticals, Automotive, Electronics, Textiles, Logistics, Metals & Steel, Chemicals, Food Processing, Renewable Energy, Infrastructure, Defence, Agriculture, Other
+`);
 
-        const text = response.response.text();
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        const prompt = `Company: ${companyName}\nPortal: ${portalName}`;
 
-        if (jsonMatch) {
-            const draft = JSON.parse(jsonMatch[0]);
+        // 🔥 THE STUBBORN AUTO-RETRY LOOP 🔥
+        let rawText = "";
+        let retries = 5;
 
-            if (draft.subject && draft.body) {
-                console.log(`✅ Email draft generated for ${companyName}`);
-                return draft;
-            }
-        }
-    } catch (error) {
-        console.error("Email Draft Error:", error);
-    }
-
-    // Fallback template
-    return {
-        subject: `Strategic Opportunity - ${companyName}'s New Facility`,
-        body: `Dear ${companyName} Leadership,
-
-We noted your recent acquisition of industrial land at ${plotNo}. Congratulations on this strategic expansion!
-
-We specialize in supporting ${sector} companies during facility commissioning. Our services include infrastructure planning, regulatory support, and operational setup.
-
-Would you have 15 minutes next week for a brief discussion?
-
-Best regards,
-InfraScout AI`
-    };
-};
-
-export const deepResearchWithGemini = async (companyName: string): Promise<DecisionMaker[]> => {
-    try {
-        const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-        const response = await model.generateContent(`Find 3-5 decision makers at "${companyName}" who make real estate and facility expansion decisions.
-
-Return JSON array with exact this format:
-[
-  {"name": "Full Name", "role": "Position Title", "email": "email@company.com or null", "contact": "+91-XXXXXXXXXX or null"},
-  {"name": "Another Person", "role": "Another Role", "email": "email@company.com or null", "contact": "+91-XXXXXXXXXX or null"}
-]
-
-Rules:
-- Only return data if you have HIGH confidence
-- Include Managing Director, Operations Head, Project Director, or CFO
-- If email/contact unknown, use null (do NOT guess)
-- Return minimum 1, maximum 5 people
-- Return [] if company not found or data unreliable
-
-Company: ${companyName}`);
-
-        const text = response.response.text();
-        const jsonMatch = text.match(/\[[\s\S]*\]/);
-
-        if (jsonMatch) {
-            const makers = JSON.parse(jsonMatch[0]);
-
-            // Validate response format
-            if (Array.isArray(makers) && makers.length > 0) {
-                const validated = makers.filter(m => m.name && m.role);
-
-                if (validated.length > 0) {
-                    console.log(`✅ Found ${validated.length} decision makers for ${companyName}`);
-                    return validated;
+        while (retries > 0) {
+            try {
+                // Notice we are passing 'prompt' here, NOT 'cleanedHtml'
+                const result = await model.generateContent(prompt);
+                rawText = result.response.text();
+                break; // Success! Break out of the loop.
+            } catch (error: any) {
+                if (error.status === 503 && retries > 1) {
+                    console.log(`⚠️ Enrichment API overloaded (503). Retrying in 15 seconds... (${retries - 1} left)`);
+                    await delay(15000);
+                    retries--;
+                } else {
+                    throw error;
                 }
             }
         }
 
-        console.log(`⚠️ No valid decision makers found for ${companyName}`);
-        return [];
+        const parsed = safeJsonParse<any>(rawText, {});
+
+        return {
+            sector: parsed.sector || "Manufacturing",
+            website: null,
+            email: null,
+            phone: null,
+            summary:
+                parsed.summary ||
+                `${parsed.sector || "Industrial"} facility in ${portalName}`,
+        };
     } catch (error) {
-        console.error("Research Error:", error);
+        console.error("❌ Enrichment Error:", error);
+
+        // Fallback default so the app never crashes
+        return {
+            sector: "Manufacturing",
+            website: null,
+            email: null,
+            phone: null,
+            summary: `Industrial facility in ${portalName}`,
+        };
+    }
+};
+
+// ======================================================
+// EMAIL DRAFT
+// ======================================================
+export const generateEmailDraft = async (
+    companyName: string,
+    plotNo: string,
+    sector: string
+): Promise<{ subject: string; body: string }> => {
+    try {
+        const model = getModel(`
+You are a professional B2B industrial outreach writer.
+
+Return ONLY JSON:
+{
+  "subject": "string",
+  "body": "string"
+}
+`);
+
+        const result = await model.generateContent(`
+Company: ${companyName}
+Plot: ${plotNo}
+Sector: ${sector}
+`);
+
+        const jsonObject = extractJsonObject(result.response.text());
+
+        if (!jsonObject) {
+            throw new Error("No valid JSON object");
+        }
+
+        const parsed = safeJsonParse<any>(jsonObject, null);
+
+        if (parsed?.subject && parsed?.body) {
+            return parsed;
+        }
+
+        throw new Error("Invalid draft");
+    } catch (error) {
+        console.error("❌ Email Draft Error:", error);
+
+        return {
+            subject: `Strategic Opportunity - ${companyName}`,
+            body: `Dear ${companyName},
+
+We noticed your recent industrial land allocation at ${plotNo}.
+
+We help ${sector} businesses accelerate expansion through infrastructure, vendor intelligence, and operational support.
+
+Would you be open to a quick discussion?
+
+Best regards,
+InfraScout AI`,
+        };
+    }
+};
+
+// ======================================================
+// DECISION MAKERS
+// ======================================================
+export const deepResearchWithGemini = async (
+    companyName: string
+): Promise<DecisionMaker[]> => {
+    try {
+        const model = getModel(`
+You are a B2B company research assistant.
+
+Return ONLY JSON array:
+[
+  {
+    "name": "string",
+    "role": "string",
+    "email": "string|null",
+    "contact": "string|null"
+  }
+]
+
+Return [] if unavailable.
+`);
+
+        const result = await model.generateContent(
+            `Find likely senior decision makers for ${companyName}`
+        );
+
+        const jsonArray = extractJsonArray(result.response.text());
+
+        if (!jsonArray) return [];
+
+        const parsed = safeJsonParse<any[]>(jsonArray, []);
+
+        if (!Array.isArray(parsed)) return [];
+
+        return parsed.filter(
+            (person) => person?.name && person?.role
+        );
+    } catch (error) {
+        console.error("❌ Research Error:", error);
         return [];
     }
 };

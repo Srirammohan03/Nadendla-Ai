@@ -1,3 +1,4 @@
+// components\LeadsDashboard.tsx
 import React, { useEffect, useState } from "react";
 import {
   collection,
@@ -12,12 +13,7 @@ import { db } from "../services/firebase";
 import { Lead } from "../types";
 import LeadRow from "./LeadRow";
 import LeadPreview from "./LeadPreview";
-import {
-  triggerDailyScout,
-  draftColdEmail,
-  seedDummyDataToDB,
-  clearAllDemoData,
-} from "../services/api";
+import { triggerDailyScout, draftColdEmail } from "../services/api";
 import toast from "react-hot-toast";
 import {
   Loader2,
@@ -203,7 +199,7 @@ const LeadsDashboard: React.FC = () => {
               </div>
               <div>
                 <h1 className="text-lg font-bold tracking-tight leading-none">
-                  InfraScout AI
+                  Nadendla AI
                 </h1>
                 <p className="text-[10px] text-gray-400 font-medium">
                   Ready-to-call land allotment leads

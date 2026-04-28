@@ -1,19 +1,6 @@
 {
-  "projects": {
-    "default": "infrascout-ai"
-  },
-  "hosting": {
-    "public": "dist",
-    "ignore": [
-      "firebase.json",
-      "**/.*",
-      "**/node_modules/**"
-    ]
-  },
   "functions": {
-    "source": "functions",
-    "runtime": "nodejs18",
-    "codebase": "default"
+    "source": "functions"
   },
   "emulators": {
     "functions": {
@@ -26,8 +13,6 @@
       "enabled": true,
       "port": 4000
     },
-    "hub": {
-      "port": 4400
-    }
+    "singleProjectMode": true
   }
 }

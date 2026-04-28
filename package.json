@@ -1,7 +1,8 @@
+
 {
-  "name": "infra-scout-ai",
+  "name": "nadendla-ai",
   "version": "1.0.0",
-  "description": "InfraScout AI - Infrastructure lead management system",
+  "description": "Nadendla AI - Infrastructure lead management system",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,6 +14,7 @@
     "axios": "^1.6.0",
     "clsx": "^1.2.1",
     "date-fns": "^2.30.0",
+    "dotenv": "^17.4.2",
     "firebase": "^9.23.0",
     "lucide-react": "^0.263.1",
     "react": "^18.2.0",

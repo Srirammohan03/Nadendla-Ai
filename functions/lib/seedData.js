@@ -25,8 +25,13 @@ var __importStar = (this && this.__importStar) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.clearDemoData = exports.generateDummyLeads = void 0;
 const admin = __importStar(require("firebase-admin"));
-// Initialize Admin SDK
+if (!admin.apps.length) {
+    admin.initializeApp();
+}
 const db = admin.firestore();
+// import * as admin from 'firebase-admin';
+// // Initialize Admin SDK
+// const db = admin.firestore();
 // Real Indian company names by sector
 const COMPANIES_BY_SECTOR = {
     'Steel & Metals': [
