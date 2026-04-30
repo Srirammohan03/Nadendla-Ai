@@ -154,10 +154,11 @@ export const dailyScout = functions
                   item.CompanyName
                 );
 
+                const force = req.query.force === "true";
                 const leadRef = db.collection("leads").doc(leadId);
                 const existingDoc = await leadRef.get();
 
-                if (existingDoc.exists) {
+                if (existingDoc.exists && !force) {
                   console.log(`⏩ Duplicate skipped: ${item.CompanyName}`);
                   continue;
                 }
@@ -249,7 +250,9 @@ export const dailyScout = functions
 // ======================================================
 // SCHEDULED SCOUT (Runs every 15 days automatically)
 // ======================================================
-export const autoScoutSchedule = functions.pubsub
+export const autoScoutSchedule = functions
+  .runWith({ timeoutSeconds: 540, memory: "2GB" })
+  .pubsub
   .schedule('0 0 */15 * *') // Runs at midnight every 15 days
   .timeZone('Asia/Kolkata')
   .onRun(async (context) => {

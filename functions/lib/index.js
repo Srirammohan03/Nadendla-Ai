@@ -224,7 +224,9 @@ exports.dailyScout = functions
 // ======================================================
 // SCHEDULED SCOUT (Runs every 15 days automatically)
 // ======================================================
-exports.autoScoutSchedule = functions.pubsub
+exports.autoScoutSchedule = functions
+    .runWith({ timeoutSeconds: 540, memory: "2GB" })
+    .pubsub
     .schedule('0 0 */15 * *') // Runs at midnight every 15 days
     .timeZone('Asia/Kolkata')
     .onRun(async (context) => {
