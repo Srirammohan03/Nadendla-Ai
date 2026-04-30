@@ -35,7 +35,7 @@ export const fetchPageContent = async (
     console.log(`[Scraper] Launching Stealth Browser for: ${url}`);
 
     browser = await puppeteer.launch({
-      headless: true,
+      headless: true, // Keep true for production
       executablePath: executablePath(),
       args: [
         "--no-sandbox",
@@ -54,25 +54,30 @@ export const fetchPageContent = async (
 
     page.setDefaultNavigationTimeout(120000);
 
+    // 1. Go to the exact URL provided in the config first
     await page.goto(url, { waitUntil: "networkidle2", timeout: 120000 });
-    console.log(`[Scraper] Initial URL: ${page.url()}`);
+    console.log(`[Scraper] Initial URL loaded: ${page.url()}`);
 
-    if (portalId && PORTAL_ALLOTMENT_PATHS[portalId]) {
+    // Let the initial page settle
+    await new Promise((r) => setTimeout(r, 5000));
+
+    let html = await page.content();
+    let isValidPage = html.toLowerCase().includes("allot") || html.toLowerCase().includes("plot") || html.toLowerCase().includes("industrial");
+
+    // 2. ONLY guess paths if the initial URL didn't seem to have the right keywords
+    if (!isValidPage && portalId && PORTAL_ALLOTMENT_PATHS[portalId]) {
       const baseUrl = new URL(url).origin;
       for (const path of PORTAL_ALLOTMENT_PATHS[portalId]) {
         try {
           const fullUrl = `${baseUrl}${path}`;
-          console.log(`[Scraper] Trying path: ${fullUrl}`);
+          console.log(`[Scraper] Initial URL lacked data. Trying fallback path: ${fullUrl}`);
 
           await page.goto(fullUrl, { waitUntil: "networkidle2", timeout: 60000 });
+          await new Promise((r) => setTimeout(r, 5000)); // Wait for slow gov servers
 
-          // 🔥 FIX 1: THE HARD WAIT 🔥
-          console.log(`[Scraper] Waiting 8 seconds for slow government APIs to load...`);
-          await new Promise((r) => setTimeout(r, 8000));
-
-          const html = await page.content();
-          if (html.includes("allot") || html.includes("plot") || html.includes("industrial")) {
-            console.log(`[Scraper] Valid allotment path confirmed.`);
+          html = await page.content();
+          if (html.toLowerCase().includes("allot") || html.toLowerCase().includes("plot") || html.toLowerCase().includes("industrial")) {
+            console.log(`[Scraper] Valid allotment path confirmed via fallback.`);
             break;
           }
         } catch (err) {
@@ -81,17 +86,41 @@ export const fetchPageContent = async (
       }
     }
 
+    // 🔥 FIX 1: THE ACCORDION CRACKER 🔥
+    // Find and click all common accordion, dropdown, and tab classes to reveal hidden tables
+    console.log(`[Scraper] Hunting and expanding hidden UI elements (Accordions/Tabs)...`);
+    await page.evaluate(() => {
+      const selectors = [
+        '.accordion-toggle', '.panel-title', '.panel-heading',
+        '[data-toggle="collapse"]', '.elementor-tab-title',
+        '.vc_tta-panel-heading', '.toggle', 'h3', 'h4'
+      ];
+
+      selectors.forEach(selector => {
+        const elements = (globalThis as any).document.querySelectorAll(selector);
+        elements.forEach((el: any) => {
+          try {
+            if (el && typeof el.click === 'function') {
+              el.click();
+            }
+          } catch (e) {
+            // ignore click errors
+          }
+        });
+      });
+    });
+
+    // Wait for the CSS animations to finish expanding the tables
+    await new Promise((r) => setTimeout(r, 4000));
+
     // 🔥 FIX 2: THE PURE TEXT EXTRACTOR 🔥
-    // Instead of looking for HTML tables (which gov sites mess up),
-    // we grab the raw, visible text exactly as a human sees it on the screen.
     console.log(`[Scraper] Extracting raw visible text to feed Gemini...`);
     let extractedText = await page.evaluate(() => {
-      // Bypassing TS errors using globalThis
       const doc = (globalThis as any).document;
       return (doc && doc.body && doc.body.innerText) || "";
     });
 
-    // Grab text from all iframes too (this is usually where gov sites hide the data)
+    // Grab text from all iframes too
     const frames = page.frames();
     for (const frame of frames) {
       try {
@@ -123,27 +152,6 @@ export const fetchPageContent = async (
       await browser.close();
     }
   }
-};
-
-// ======================================================
-// HTML QUALITY SCORER (Kept for compatibility, though largely unused now)
-// ======================================================
-const scoreHtml = (html: string): number => {
-  let score = 0;
-
-  const lower = html.toLowerCase();
-
-  if (lower.includes("<table")) score += 50;
-  if (lower.includes("allot")) score += 40;
-  if (lower.includes("plot")) score += 30;
-  if (lower.includes("industrial")) score += 30;
-  if (lower.includes("company")) score += 20;
-  if (lower.includes("acre")) score += 20;
-  if (lower.includes("survey")) score += 15;
-
-  score += Math.min(html.length / 5000, 30);
-
-  return score;
 };
 
 // for (const selector of candidateSelectors) {

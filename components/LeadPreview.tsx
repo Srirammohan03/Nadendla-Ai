@@ -1,3 +1,4 @@
+// components\LeadPreview.tsx
 import React, { useState } from 'react';
 import { Lead } from '../types';
 import { format } from 'date-fns';

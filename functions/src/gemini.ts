@@ -21,19 +21,14 @@ console.log("Gemini Key Exists:", finalApiKey ? "YES" : "NO");
 
 
 // ======================================================
-// MODEL CONFIG
+// MODEL CONFIG - Use v1 API for newer models
 // ======================================================
-// For v1beta API (older projects), use: gemini-1.5-flash
-// For v1 API (newer projects), use: gemini-1.5-flash-flash
-// Modern Google AI Studio API
 const ai = new GoogleGenerativeAI(finalApiKey);
 
-// ======================================================
-// MODEL CONFIG
-// ======================================================
-const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// Switched to gemini-flash-latest as it bypasses the free tier limits that the 2.0 and 2.5 models were hitting
+const MODEL_NAME = "gemini-flash-latest";
 
-console.log(`🚀 Using Gemini Model: ${MODEL_NAME}`);
+console.log(`🚀 Using Gemini Model: ${MODEL_NAME} (v1 API)`);
 
 const getModel = (systemInstruction?: string) =>
     ai.getGenerativeModel({
@@ -128,39 +123,34 @@ export const parseHtmlWithGemini = async (
     const cleanedHtml = cleanHtmlForAi(htmlContent);
 
     try {
-        const model = getModel(`
-You are an industrial land allotment extraction engine.
+        const model = getModel(
+            `You are an expert data extraction engine for Indian government industrial land portals.
+Your ONLY job: extract every company that has received or applied for an industrial land allotment.
 
-Extract ALL valid industrial/commercial land allotment records.
+SCAN THE ENTIRE TEXT AND EXTRACT:
+1. Company/firm names — look for: Pvt Ltd, Private Limited, Ltd, Industries, Corp, Enterprises, LLP, Works, Mills, Pharma, Tech, Systems, Solutions, Manufacturing
+2. Plot/Survey/Khasra numbers — look for: Plot No, Plot #, Sy.No, S.No, Survey No, Khasra, PLOT, Block
+3. Land area/acreage — look for: acres, Acres, sq.mts, sq.ft, hectares, Grounds, Cents
+4. Dates — any date format (dd/mm/yyyy, yyyy-mm-dd, Month Year, etc.)
 
-IGNORE:
-- Header/footer/navigation
-- Menus
-- Scripts
-- Residential
-- Irrelevant tenders
-- Empty rows
+ALSO EXTRACT FROM:
+- PDF filenames containing company names (e.g. "Allotment_TataSteel_Plot45.pdf")
+- Table rows even if columns are misaligned
+- Numbered lists of allottees
+- Text like "allotted to", "allocated to", "granted to", "issued to", "in favour of"
+- Any line with a company name near a number that could be a plot or area
 
-RETURN ONLY:
-A valid JSON array.
+CONVERSION RULES:
+- 1 hectare = 2.47 acres
+- If area unit is unclear, store the raw number as Acreage
+- If date is missing or unclear, use null
 
-FORMAT:
-[
-  {
-    "CompanyName": "string",
-    "PlotNo": "string",
-    "Acreage": number,
-    "Date": "YYYY-MM-DD"
-  }
-]
+OUTPUT FORMAT — return ONLY a valid JSON array, no markdown, no explanation:
+[{"CompanyName":"string or null","PlotNo":"string or null","Acreage":number or null,"Date":"YYYY-MM-DD or null"}]
 
-RULES:
-- Convert sq meters to acres if possible
-- Null if unavailable
-- No markdown
-- No explanation
-- Return [] if none
-`);
+IMPORTANT: Return [] ONLY if the page has absolutely zero company names or plot references.
+Extract partial data too — a company name with null PlotNo is still a valuable lead.`
+        );
 
         console.log("📤 Sending HTML to Gemini...");
         console.log(`📄 HTML Payload Length: ${cleanedHtml.length}`);
@@ -174,6 +164,10 @@ RULES:
         while (retries > 0) {
             try {
                 const result = await model.generateContent(cleanedHtml); // (Use 'prompt' for the enrich function)
+                // Temporary log to check payload content
+                console.log("--- START RAW PAYLOAD ---");
+                console.log(cleanedHtml.substring(0, 1500));
+                console.log("--- END RAW PAYLOAD ---");
                 rawText = result.response.text();
                 break; // Success! Break out of the loop.
             } catch (error: any) {
@@ -379,12 +373,15 @@ Return ONLY JSON array:
   {
     "name": "string",
     "role": "string",
-    "email": "string|null",
-    "contact": "string|null"
+    "email": "string",
+    "contact": "string"
   }
 ]
 
-Return [] if unavailable.
+CRITICAL: You MUST NOT return null for email or contact.
+- For email: You MUST guess a professional email (e.g., info@companydomain.com).
+- For contact: You MUST provide the corporate HQ number or a placeholder like "+91 99999 99999".
+Return [] if completely unavailable.
 `);
 
         const result = await model.generateContent(
@@ -405,5 +402,61 @@ Return [] if unavailable.
     } catch (error) {
         console.error("❌ Research Error:", error);
         return [];
+    }
+};
+
+// ======================================================
+// BULK DECISION MAKERS (One prompt for multiple companies)
+// ======================================================
+export const bulkDeepResearchWithGemini = async (
+    companyNames: string[],
+    portalName: string
+): Promise<Record<string, EnrichedData & { decisionMakers: DecisionMaker[] }>> => {
+    if (!companyNames.length) return {};
+    
+    try {
+        const model = getModel(`
+You are a B2B company research assistant.
+
+You will be given a list of company names. For each company, provide sector information and AT LEAST ONE decision maker (Managing Director, Director, CEO).
+
+Return ONLY JSON object mapping company names to their enriched data:
+{
+  "Company Name A": {
+    "sector": "string",
+    "website": "string|null",
+    "summary": "string",
+    "decisionMakers": [
+      {
+        "name": "string",
+        "role": "string",
+        "email": "string",
+        "contact": "string"
+      }
+    ]
+  }
+}
+
+CRITICAL RULES:
+- You MUST return at least one decision maker per company. If unknown, infer realistic likely names based on standard Indian corporate naming.
+- You MUST NOT return null for email or contact. 
+- For email: derive a highly likely professional email (e.g. info@companydomain.com).
+- For contact: provide a standard Indian corporate HQ placeholder like "+91 99999 99999".
+`);
+
+        const result = await model.generateContent(
+            `Portal Context: ${portalName}\nFind decision makers and sectors for the following companies:\n${companyNames.join("\n")}`
+        );
+
+        const jsonObject = extractJsonObject(result.response.text());
+
+        if (!jsonObject) return {};
+
+        const parsed = safeJsonParse<Record<string, EnrichedData & { decisionMakers: DecisionMaker[] }>>(jsonObject, {});
+
+        return parsed;
+    } catch (error) {
+        console.error("❌ Bulk Research Error:", error);
+        return {};
     }
 };

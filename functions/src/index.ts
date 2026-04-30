@@ -6,20 +6,20 @@ console.log("Gemini Key Exists:", process.env.GEMINI_API_KEY ? "YES" : "NO");
 
 import * as functions from "firebase-functions/v1";
 import * as admin from "firebase-admin";
+import { Timestamp } from "firebase-admin/firestore";
 import cors from "cors";
 import * as crypto from "crypto";
 
 import { PORTALS } from "./config";
 import {
   parseHtmlWithGemini,
-  enrichLeadWithGemini,
   generateEmailDraft,
   deepResearchWithGemini,
+  bulkDeepResearchWithGemini,
   ExtractedLead,
 } from "./gemini";
 
 import { fetchPageContent } from "./scraper";
-import { generateDummyLeads, clearDemoData } from "./seedData";
 
 // ======================================================
 // FIREBASE INIT
@@ -140,6 +140,9 @@ export const dailyScout = functions
 
             const batch = db.batch();
             let batchCount = 0;
+            
+            // Gather new unique leads first
+            const newValidLeads: Array<{ item: ExtractedLead, leadId: string }> = [];
 
             for (const item of extractedData) {
               try {
@@ -158,13 +161,33 @@ export const dailyScout = functions
                   console.log(`⏩ Duplicate skipped: ${item.CompanyName}`);
                   continue;
                 }
+                
+                newValidLeads.push({ item, leadId });
+              } catch (leadCheckError) {
+                  console.error("Error checking existing lead", leadCheckError);
+              }
+            }
 
-                console.log(`🔍 Enriching lead: ${item.CompanyName}`);
+            if (newValidLeads.length > 0) {
+              console.log(`🔍 Bulk Enriching ${newValidLeads.length} leads for ${portal.name}...`);
+              
+              const companyNames = newValidLeads
+                .map(nl => nl.item.CompanyName)
+                .filter(Boolean) as string[];
 
-                const enriched = await enrichLeadWithGemini(
-                  item.CompanyName || "",
-                  portal.name
-                );
+              // Bulk fetch both Enrichment AND Decision Makers in 1 API call!
+              const bulkData = await bulkDeepResearchWithGemini(companyNames, portal.name);
+
+              for (const { item, leadId } of newValidLeads) {
+                const leadRef = db.collection("leads").doc(leadId);
+                
+                const companyNameStr = item.CompanyName || "";
+                const enriched = bulkData[companyNameStr] || {
+                    sector: "Manufacturing",
+                    website: null,
+                    summary: `Industrial facility in ${portal.name}`,
+                    decisionMakers: []
+                };
 
                 const leadPayload = {
                   companyName: item.CompanyName || null,
@@ -174,29 +197,22 @@ export const dailyScout = functions
                   portalId: portal.id,
                   portalName: portal.name,
                   sourceUrl: targetUrl,
-                  sector: enriched.sector,
-                  website: enriched.website,
-                  contactEmail: enriched.email,
-                  contactPhone: enriched.phone,
-                  summary: enriched.summary,
-                  // 🔥 THE FIX: Use standard Timestamp.now() to avoid version conflicts 🔥
-                  createdAt: admin.firestore.Timestamp.now(),
-                  updatedAt: admin.firestore.Timestamp.now(),
+                  sector: enriched.sector || "Manufacturing",
+                  website: enriched.website || null,
+                  summary: enriched.summary || null,
+                  decisionMakers: enriched.decisionMakers || [],
+                  status: (enriched.decisionMakers && enriched.decisionMakers.length > 0) ? 'researched' : 'new',
+                  // Use Timestamp.fromDate for emulator compatibility
+                  createdAt: Timestamp.fromDate(new Date()),
+                  updatedAt: Timestamp.fromDate(new Date()),
+                  lastResearched: Timestamp.fromDate(new Date()),
                 };
 
                 batch.set(leadRef, leadPayload);
-
                 batchCount++;
                 results.added++;
-              } catch (leadError: any) {
-                console.error(`❌ Lead processing error:`, leadError);
-                results.errors.push(
-                  `${portal.name}: ${item.CompanyName || "Unknown"} failed`
-                );
               }
-            }
-
-            if (batchCount > 0) {
+              
               await batch.commit();
               console.log(
                 `✅ Successfully committed ${batchCount} new leads for ${portal.name}`
@@ -228,6 +244,78 @@ export const dailyScout = functions
         });
       }
     });
+  });
+
+// ======================================================
+// SCHEDULED SCOUT (Runs every 15 days automatically)
+// ======================================================
+export const autoScoutSchedule = functions.pubsub
+  .schedule('0 0 */15 * *') // Runs at midnight every 15 days
+  .timeZone('Asia/Kolkata')
+  .onRun(async (context) => {
+      console.log("⏰ Starting 15-day auto-scout schedule...");
+      
+      for (const portal of PORTALS) {
+        try {
+          const targetUrl = portal.allotmentPath && portal.allotmentPath.length > 0 
+            ? `${portal.url}${portal.allotmentPath[0]}` 
+            : portal.dataUrl;
+
+          const html = await fetchPageContent(targetUrl, portal.id);
+          if (!html || html.length < 50) continue;
+
+          const extractedData = await parseHtmlWithGemini(html);
+          if (!extractedData.length) continue;
+
+          const batch = db.batch();
+          let batchCount = 0;
+          const newValidLeads: Array<{ item: ExtractedLead, leadId: string }> = [];
+
+          for (const item of extractedData) {
+            if (!item.CompanyName && !item.PlotNo) continue;
+            const leadId = generateLeadId(portal.id, item.PlotNo, item.CompanyName);
+            const leadRef = db.collection("leads").doc(leadId);
+            const existingDoc = await leadRef.get();
+            if (existingDoc.exists) continue;
+            newValidLeads.push({ item, leadId });
+          }
+
+          if (newValidLeads.length > 0) {
+            const companyNames = newValidLeads.map(nl => nl.item.CompanyName).filter(Boolean) as string[];
+            const bulkData = await bulkDeepResearchWithGemini(companyNames, portal.name);
+
+            for (const { item, leadId } of newValidLeads) {
+              const leadRef = db.collection("leads").doc(leadId);
+              const companyNameStr = item.CompanyName || "";
+              const enriched = bulkData[companyNameStr] || { sector: "Manufacturing", website: null, summary: null, decisionMakers: [] };
+
+              batch.set(leadRef, {
+                companyName: item.CompanyName || null,
+                plotNo: item.PlotNo || null,
+                acreage: item.Acreage || null,
+                date: item.Date || null,
+                portalId: portal.id,
+                portalName: portal.name,
+                sourceUrl: targetUrl,
+                sector: enriched.sector || "Manufacturing",
+                website: enriched.website || null,
+                summary: enriched.summary || null,
+                decisionMakers: enriched.decisionMakers || [],
+                status: (enriched.decisionMakers && enriched.decisionMakers.length > 0) ? 'researched' : 'new',
+                createdAt: Timestamp.fromDate(new Date()),
+                updatedAt: Timestamp.fromDate(new Date()),
+                lastResearched: Timestamp.fromDate(new Date()),
+              });
+              batchCount++;
+            }
+            await batch.commit();
+            console.log(`✅ Auto-scout committed ${batchCount} leads for ${portal.name}`);
+          }
+        } catch (error) {
+          console.error(`❌ Auto-scout failed for ${portal.name}:`, error);
+        }
+      }
+      return null;
   });
 
 // ======================================================
@@ -295,7 +383,7 @@ export const deepResearch = functions.https.onRequest((req, res) => {
       if (leadId) {
         await db.collection("leads").doc(leadId).update({
           decisionMakers,
-          lastResearched: admin.firestore.Timestamp.now(),
+          lastResearched: Timestamp.fromDate(new Date()),
         });
       }
 
@@ -317,61 +405,4 @@ export const deepResearch = functions.https.onRequest((req, res) => {
     }
   });
 });
-
-// ======================================================
-// SEED DATA
-// ======================================================
-export const seedDummyData = functions.https.onRequest((req, res) => {
-  return corsHandler(req, res, async () => {
-    if (handleOptions(req, res)) return;
-
-    try {
-      const result = await generateDummyLeads();
-
-      return res.status(200).json({
-        success: result.success,
-        count: result.count,
-        message: result.message,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (e: any) {
-      console.error("❌ Seed error:", e);
-
-      return res.status(500).json({
-        success: false,
-        message: `Error: ${e.message}`,
-        count: 0,
-        timestamp: new Date().toISOString(),
-      });
-    }
-  });
-});
-
-// ======================================================
-// CLEAR DEMO DATA
-// ======================================================
-export const clearDemoDataFunction = functions.https.onRequest((req, res) => {
-  return corsHandler(req, res, async () => {
-    if (handleOptions(req, res)) return;
-
-    try {
-      const result = await clearDemoData();
-
-      return res.status(200).json({
-        success: result.success,
-        count: result.count,
-        message: result.message,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (e: any) {
-      console.error("❌ Clear error:", e);
-
-      return res.status(500).json({
-        success: false,
-        message: `Error: ${e.message}`,
-        count: 0,
-        timestamp: new Date().toISOString(),
-      });
-    }
-  });
-});
+// (Demo data endpoints removed)

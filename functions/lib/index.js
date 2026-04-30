@@ -26,19 +26,19 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.clearDemoDataFunction = exports.seedDummyData = exports.deepResearch = exports.draftEmail = exports.dailyScout = void 0;
+exports.deepResearch = exports.draftEmail = exports.autoScoutSchedule = exports.dailyScout = void 0;
 // functions/src/index.ts
 const dotenv = __importStar(require("dotenv"));
 dotenv.config();
 console.log("Gemini Key Exists:", process.env.GEMINI_API_KEY ? "YES" : "NO");
 const functions = __importStar(require("firebase-functions/v1"));
 const admin = __importStar(require("firebase-admin"));
+const firestore_1 = require("firebase-admin/firestore");
 const cors_1 = __importDefault(require("cors"));
 const crypto = __importStar(require("crypto"));
 const config_1 = require("./config");
 const gemini_1 = require("./gemini");
 const scraper_1 = require("./scraper");
-const seedData_1 = require("./seedData");
 // ======================================================
 // FIREBASE INIT
 // ======================================================
@@ -105,6 +105,9 @@ exports.dailyScout = functions
                     // FOR TESTING ONLY: Injecting dummy text to prove pipeline works
                     // REMOVE THIS ONCE YOU WRITE YOUR PDF SCRAPER!
                     const dataToParse = html;
+                    console.log("--- RAW TEXT START ---");
+                    console.log(html?.substring(0, 2000)); // Print the first 2000 characters to your terminal
+                    console.log("--- RAW TEXT END ---");
                     if (!dataToParse || dataToParse.length < 50) {
                         const msg = `Skipping ${portal.name}: Empty or invalid content`;
                         console.warn(msg);
@@ -131,6 +134,8 @@ exports.dailyScout = functions
                     results.parsed += extractedData.length;
                     const batch = db.batch();
                     let batchCount = 0;
+                    // Gather new unique leads first
+                    const newValidLeads = [];
                     for (const item of extractedData) {
                         try {
                             if (!item.CompanyName && !item.PlotNo)
@@ -142,8 +147,28 @@ exports.dailyScout = functions
                                 console.log(`⏩ Duplicate skipped: ${item.CompanyName}`);
                                 continue;
                             }
-                            console.log(`🔍 Enriching lead: ${item.CompanyName}`);
-                            const enriched = await (0, gemini_1.enrichLeadWithGemini)(item.CompanyName || "", portal.name);
+                            newValidLeads.push({ item, leadId });
+                        }
+                        catch (leadCheckError) {
+                            console.error("Error checking existing lead", leadCheckError);
+                        }
+                    }
+                    if (newValidLeads.length > 0) {
+                        console.log(`🔍 Bulk Enriching ${newValidLeads.length} leads for ${portal.name}...`);
+                        const companyNames = newValidLeads
+                            .map(nl => nl.item.CompanyName)
+                            .filter(Boolean);
+                        // Bulk fetch both Enrichment AND Decision Makers in 1 API call!
+                        const bulkData = await (0, gemini_1.bulkDeepResearchWithGemini)(companyNames, portal.name);
+                        for (const { item, leadId } of newValidLeads) {
+                            const leadRef = db.collection("leads").doc(leadId);
+                            const companyNameStr = item.CompanyName || "";
+                            const enriched = bulkData[companyNameStr] || {
+                                sector: "Manufacturing",
+                                website: null,
+                                summary: `Industrial facility in ${portal.name}`,
+                                decisionMakers: []
+                            };
                             const leadPayload = {
                                 companyName: item.CompanyName || null,
                                 plotNo: item.PlotNo || null,
@@ -152,25 +177,20 @@ exports.dailyScout = functions
                                 portalId: portal.id,
                                 portalName: portal.name,
                                 sourceUrl: targetUrl,
-                                sector: enriched.sector,
-                                website: enriched.website,
-                                contactEmail: enriched.email,
-                                contactPhone: enriched.phone,
-                                summary: enriched.summary,
-                                // 🔥 THE FIX: Use standard Timestamp.now() to avoid version conflicts 🔥
-                                createdAt: admin.firestore.Timestamp.now(),
-                                updatedAt: admin.firestore.Timestamp.now(),
+                                sector: enriched.sector || "Manufacturing",
+                                website: enriched.website || null,
+                                summary: enriched.summary || null,
+                                decisionMakers: enriched.decisionMakers || [],
+                                status: (enriched.decisionMakers && enriched.decisionMakers.length > 0) ? 'researched' : 'new',
+                                // Use Timestamp.fromDate for emulator compatibility
+                                createdAt: firestore_1.Timestamp.fromDate(new Date()),
+                                updatedAt: firestore_1.Timestamp.fromDate(new Date()),
+                                lastResearched: firestore_1.Timestamp.fromDate(new Date()),
                             };
                             batch.set(leadRef, leadPayload);
                             batchCount++;
                             results.added++;
                         }
-                        catch (leadError) {
-                            console.error(`❌ Lead processing error:`, leadError);
-                            results.errors.push(`${portal.name}: ${item.CompanyName || "Unknown"} failed`);
-                        }
-                    }
-                    if (batchCount > 0) {
                         await batch.commit();
                         console.log(`✅ Successfully committed ${batchCount} new leads for ${portal.name}`);
                     }
@@ -200,6 +220,74 @@ exports.dailyScout = functions
             });
         }
     });
+});
+// ======================================================
+// SCHEDULED SCOUT (Runs every 15 days automatically)
+// ======================================================
+exports.autoScoutSchedule = functions.pubsub
+    .schedule('0 0 */15 * *') // Runs at midnight every 15 days
+    .timeZone('Asia/Kolkata')
+    .onRun(async (context) => {
+    console.log("⏰ Starting 15-day auto-scout schedule...");
+    for (const portal of config_1.PORTALS) {
+        try {
+            const targetUrl = portal.allotmentPath && portal.allotmentPath.length > 0
+                ? `${portal.url}${portal.allotmentPath[0]}`
+                : portal.dataUrl;
+            const html = await (0, scraper_1.fetchPageContent)(targetUrl, portal.id);
+            if (!html || html.length < 50)
+                continue;
+            const extractedData = await (0, gemini_1.parseHtmlWithGemini)(html);
+            if (!extractedData.length)
+                continue;
+            const batch = db.batch();
+            let batchCount = 0;
+            const newValidLeads = [];
+            for (const item of extractedData) {
+                if (!item.CompanyName && !item.PlotNo)
+                    continue;
+                const leadId = generateLeadId(portal.id, item.PlotNo, item.CompanyName);
+                const leadRef = db.collection("leads").doc(leadId);
+                const existingDoc = await leadRef.get();
+                if (existingDoc.exists)
+                    continue;
+                newValidLeads.push({ item, leadId });
+            }
+            if (newValidLeads.length > 0) {
+                const companyNames = newValidLeads.map(nl => nl.item.CompanyName).filter(Boolean);
+                const bulkData = await (0, gemini_1.bulkDeepResearchWithGemini)(companyNames, portal.name);
+                for (const { item, leadId } of newValidLeads) {
+                    const leadRef = db.collection("leads").doc(leadId);
+                    const companyNameStr = item.CompanyName || "";
+                    const enriched = bulkData[companyNameStr] || { sector: "Manufacturing", website: null, summary: null, decisionMakers: [] };
+                    batch.set(leadRef, {
+                        companyName: item.CompanyName || null,
+                        plotNo: item.PlotNo || null,
+                        acreage: item.Acreage || null,
+                        date: item.Date || null,
+                        portalId: portal.id,
+                        portalName: portal.name,
+                        sourceUrl: targetUrl,
+                        sector: enriched.sector || "Manufacturing",
+                        website: enriched.website || null,
+                        summary: enriched.summary || null,
+                        decisionMakers: enriched.decisionMakers || [],
+                        status: (enriched.decisionMakers && enriched.decisionMakers.length > 0) ? 'researched' : 'new',
+                        createdAt: firestore_1.Timestamp.fromDate(new Date()),
+                        updatedAt: firestore_1.Timestamp.fromDate(new Date()),
+                        lastResearched: firestore_1.Timestamp.fromDate(new Date()),
+                    });
+                    batchCount++;
+                }
+                await batch.commit();
+                console.log(`✅ Auto-scout committed ${batchCount} leads for ${portal.name}`);
+            }
+        }
+        catch (error) {
+            console.error(`❌ Auto-scout failed for ${portal.name}:`, error);
+        }
+    }
+    return null;
 });
 // ======================================================
 // DRAFT EMAIL
@@ -255,7 +343,7 @@ exports.deepResearch = functions.https.onRequest((req, res) => {
             if (leadId) {
                 await db.collection("leads").doc(leadId).update({
                     decisionMakers,
-                    lastResearched: admin.firestore.Timestamp.now(),
+                    lastResearched: firestore_1.Timestamp.fromDate(new Date()),
                 });
             }
             return res.status(200).json({
@@ -276,57 +364,4 @@ exports.deepResearch = functions.https.onRequest((req, res) => {
         }
     });
 });
-// ======================================================
-// SEED DATA
-// ======================================================
-exports.seedDummyData = functions.https.onRequest((req, res) => {
-    return corsHandler(req, res, async () => {
-        if (handleOptions(req, res))
-            return;
-        try {
-            const result = await (0, seedData_1.generateDummyLeads)();
-            return res.status(200).json({
-                success: result.success,
-                count: result.count,
-                message: result.message,
-                timestamp: new Date().toISOString(),
-            });
-        }
-        catch (e) {
-            console.error("❌ Seed error:", e);
-            return res.status(500).json({
-                success: false,
-                message: `Error: ${e.message}`,
-                count: 0,
-                timestamp: new Date().toISOString(),
-            });
-        }
-    });
-});
-// ======================================================
-// CLEAR DEMO DATA
-// ======================================================
-exports.clearDemoDataFunction = functions.https.onRequest((req, res) => {
-    return corsHandler(req, res, async () => {
-        if (handleOptions(req, res))
-            return;
-        try {
-            const result = await (0, seedData_1.clearDemoData)();
-            return res.status(200).json({
-                success: result.success,
-                count: result.count,
-                message: result.message,
-                timestamp: new Date().toISOString(),
-            });
-        }
-        catch (e) {
-            console.error("❌ Clear error:", e);
-            return res.status(500).json({
-                success: false,
-                message: `Error: ${e.message}`,
-                count: 0,
-                timestamp: new Date().toISOString(),
-            });
-        }
-    });
-});
+// (Demo data endpoints removed)

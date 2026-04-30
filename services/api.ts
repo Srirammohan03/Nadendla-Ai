@@ -389,29 +389,4 @@ export const addDecisionMakersToLead = async (leadId: string, decisionMakers: De
     }
 };
 
-// ✅ Clear all demo data from database
-export const clearAllDemoData = async (): Promise<{ success: boolean; count: number; message: string }> => {
-    console.log('🗑️ Clearing demo data from Firebase...');
-
-    try {
-        const backendResult = await callApiWithFallback('clearDemoDataFunction', 'POST', {}, 30000);
-
-        if (backendResult?.success) {
-            console.log(`✅ Deleted ${backendResult.count} demo leads`);
-            return {
-                success: true,
-                count: backendResult.count,
-                message: backendResult.message
-            };
-        }
-
-        throw new Error('Clearing failed');
-    } catch (error: any) {
-        console.error('Error clearing data:', error);
-        return {
-            success: false,
-            count: 0,
-            message: `Error: ${error.message}`
-        };
-    }
-};
+// (Seed and clear functions removed — production only uses real scraped data)

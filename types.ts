@@ -3,8 +3,8 @@ import { Timestamp } from 'firebase/firestore';
 export interface DecisionMaker {
   name: string;
   role: string;
-  contact?: string;
-  email?: string;
+  contact?: string | null;
+  email?: string | null;
 }
 
 export type LeadStatus = 'new' | 'viewed' | 'researched' | 'contacted';
@@ -14,9 +14,12 @@ export interface Lead {
   companyName: string | null;
   plotNo: string | null;
   acreage: number | null;
-  datePosted?: Date | null; // Date when lead was posted
-  date?: string | null; // ISO Date String (legacy)
+  /** Legacy ISO date string from backend extraction */
+  date?: string | null;
+  /** Portal identifier e.g. "AP_APIIC" */
   portalId: string;
+  /** Human readable portal name e.g. "APIIC" */
+  portalName?: string | null;
   sourceUrl: string;
   sector: string | null;
   website?: string | null;
@@ -26,6 +29,9 @@ export interface Lead {
   decisionMakers?: DecisionMaker[];
   status?: LeadStatus;
   createdAt: Timestamp;
+  updatedAt?: Timestamp;
+  /** Flag for demo/seed data so it can be cleared separately */
+  isDemoData?: boolean;
 }
 
 export interface DraftEmailResponse {
@@ -34,20 +40,10 @@ export interface DraftEmailResponse {
 }
 
 export enum PortalId {
-  AP_APIIC = 'Andhra Pradesh (APIIC)',
-  BR_BIADA = 'Bihar (BIADA)',
-  CG_CSIDC = 'Chhattisgarh (CSIDC)',
-  GJ_GIDC = 'Gujarat (GIDC)',
-  HR_HSIIDC = 'Haryana (HSIIDC)',
-  KA_KIADB = 'Karnataka (KIADB)',
-  KL_KINFRA = 'Kerala (KINFRA)',
-  MP_MPIDC = 'Madhya Pradesh (MPIDC)',
-  MH_MIDC = 'Maharashtra (MIDC)',
-  OD_IDCO = 'Odisha (IDCO)',
-  PB_PSIEC = 'Punjab (PSIEC)',
-  RJ_RIICO = 'Rajasthan (RIICO)',
-  TN_SIPCOT = 'Tamil Nadu (SIPCOT)',
-  TG_TGIIC = 'Telangana (TGIIC)',
-  UP_UPSIDA = 'Uttar Pradesh (UPSIDA)',
-  WB_WBIIDC = 'West Bengal (WBIIDC)'
+  AP_APIIC = 'AP_APIIC',
+  TG_TGIIC = 'TG_TGIIC',
+  MH_MIDC = 'MH_MIDC',
+  KA_KIADB = 'KA_KIADB',
+  TN_SIPCOT = 'TN_SIPCOT',
+  GJ_GIDC = 'GJ_GIDC',
 }
