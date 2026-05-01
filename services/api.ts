@@ -7,17 +7,19 @@ import { Lead, DecisionMaker } from '../types';
 const getApiUrl = (): string => {
     const env = import.meta.env;
     const useEmulator = env.VITE_USE_EMULATOR === 'true';
+    const projectId = env.VITE_FIREBASE_PROJECT_ID || 'infrascout-ai';
+    const region = env.VITE_FIREBASE_REGION || 'us-central1';
 
     if (useEmulator) {
         return (
             env.VITE_FUNCTIONS_EMULATOR_URL ||
-            'http://127.0.0.1:5001/infrascout-ai/us-central1'
+            `http://127.0.0.1:5001/${projectId}/${region}`
         );
     }
 
     return (
         env.VITE_REACT_APP_API_URL ||
-        'https://us-central1-infrascout-ai.cloudfunctions.net'
+        `https://${region}-${projectId}.cloudfunctions.net`
     );
 };
 
@@ -112,12 +114,15 @@ export const triggerDailyScout = async (portalId: string) => {
 
         // ❌ Backend totally failed
         if (!backendResult || backendResult.success === false) {
+            const isEmulator = import.meta.env.VITE_USE_EMULATOR === 'true';
             return {
                 addedCount: 0,
                 mode: 'error',
                 message:
                     backendResult?.error ||
-                    'Backend failed. Check Firebase emulator terminal.',
+                    (isEmulator 
+                        ? 'Backend failed. Check Firebase emulator terminal.' 
+                        : 'Backend failed. The service might be down or misconfigured.'),
             };
         }
 

@@ -141,9 +141,10 @@ exports.dailyScout = functions
                             if (!item.CompanyName && !item.PlotNo)
                                 continue;
                             const leadId = generateLeadId(portal.id, item.PlotNo, item.CompanyName);
+                            const force = req.query.force === "true";
                             const leadRef = db.collection("leads").doc(leadId);
                             const existingDoc = await leadRef.get();
-                            if (existingDoc.exists) {
+                            if (existingDoc.exists && !force) {
                                 console.log(`⏩ Duplicate skipped: ${item.CompanyName}`);
                                 continue;
                             }
